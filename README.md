@@ -2,9 +2,11 @@
 
 Download single songs and playlists from Suno via UI. Alternatively, use the download scripts to grab songs and playlists programmatically.
 
-![Suno MP3 Downloader GUI](https://github.com/user-attachments/assets/237cf07f-a31e-483d-941e-86d9accd39c1)
+![Suno MP3 Downloader GUI](https://github.com/user-attachments/assets/4f64bcec-9413-4a22-8f23-33d557d707e6)
 
 ## Downloading Songs/Playlists via UI
+
+1. Clone or download the code from this repository.
 
 1. Open the UI:
     - **Windows:** `run_gui.bat`
@@ -17,7 +19,7 @@ Download single songs and playlists from Suno via UI. Alternatively, use the dow
     uv run suno_download_gui.py
     ```
 
-2. Once the GUI is open: paste a Suno song or playlist URL, or a 36-character ID. The GUI supports single songs and public playlists, optional clip times for songs, background downloads with progress, a persistent download folder, playlist subfolders, dark mode, and ID3 metadata tagging.
+1. Once the GUI is open: paste a Suno song or playlist URL, or a 36-character ID. The GUI supports single songs and public playlists, optional clip times for songs, background downloads with progress, a persistent download folder, playlist subfolders, dark mode, and ID3 metadata tagging.
 
 ## Command Line Interface
 
