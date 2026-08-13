@@ -1,0 +1,18 @@
+[project]
+name = "suno-scraper"
+version = "0.1.0"
+description = "Download Suno songs from CDN without using official download quota"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "imageio-ffmpeg>=0.5.1",
+    "mutagen>=1.48.1",
+    "pyside6>=6.11.1",
+]
+
+[project.scripts]
+suno-download-mp3 = "download_song_mp3:main"
+suno-download-mp3-streaming = "download_song_mp3_streaming:main"
+suno-download-playlist = "download_playlist_mp3:main"
+suno-download-gui = "suno_download_gui:main"

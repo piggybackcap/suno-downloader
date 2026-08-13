@@ -1,0 +1,23 @@
+# Virtualenv / uv
+.venv/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# App output
+downloads/
+*.mp3
+
+# Local interpreter pin
+.python-version
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
