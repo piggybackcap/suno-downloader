@@ -176,12 +176,14 @@ class DownloadWorker(QThread):
         *,
         use_subfolder: bool,
         clip: ClipRange | None = None,
+        attach_metadata: bool = True,
     ) -> None:
         super().__init__()
         self.url_input = url_input
         self.output_dir = output_dir
         self.use_subfolder = use_subfolder
         self.clip = clip
+        self.attach_metadata = attach_metadata
 
     def run(self) -> None:
         try:
@@ -196,6 +198,7 @@ class DownloadWorker(QThread):
                     self.output_dir,
                     progress=on_progress,
                     clip=self.clip,
+                    attach_metadata=self.attach_metadata,
                 )
                 self.finished_ok.emit(DownloadResult(str(path), song=metadata))
                 return
@@ -209,6 +212,7 @@ class DownloadWorker(QThread):
                 use_subfolder=self.use_subfolder,
                 progress=on_progress,
                 on_track=on_track,
+                attach_metadata=self.attach_metadata,
             )
             saved_to = str(paths[0].parent) if paths else str(self.output_dir)
             self.finished_ok.emit(
@@ -339,6 +343,13 @@ class MainWindow(QMainWindow):
         self.playlist_subfolder_checkbox.toggled.connect(self._save_settings)
         playlists.addWidget(self.playlist_subfolder_checkbox)
 
+        metadata = _add_group(layout, "Metadata")
+        self.attach_metadata_checkbox = QCheckBox(
+            "Download and attach metadata (title, author, cover art, styles, etc.)"
+        )
+        self.attach_metadata_checkbox.toggled.connect(self._save_settings)
+        metadata.addWidget(self.attach_metadata_checkbox)
+
         appearance = _add_group(layout, "Appearance")
         self.dark_mode_checkbox = QCheckBox("Dark mode")
         self.dark_mode_checkbox.toggled.connect(self._on_dark_mode_toggled)
@@ -357,11 +368,14 @@ class MainWindow(QMainWindow):
         self.folder_input.setText(str(folder))
         self._set_checkbox(self.dark_mode_checkbox, "dark_mode", False)
         self._set_checkbox(self.playlist_subfolder_checkbox, "playlist_subfolder", True)
+        self._set_checkbox(self.attach_metadata_checkbox, "attach_metadata", True)
 
     def _save_settings(self) -> None:
         self.settings.setValue("output_dir", self.folder_input.text().strip())
         self.settings.setValue("dark_mode", self.dark_mode_checkbox.isChecked())
         self.settings.setValue("playlist_subfolder", self.playlist_subfolder_checkbox.isChecked())
+        self.settings.setValue("attach_metadata", self.attach_metadata_checkbox.isChecked())
+        self.settings.sync()
 
     def _refresh_format_options(self) -> None:
         self.format_combo.clear()
@@ -402,6 +416,7 @@ class MainWindow(QMainWindow):
         self._download_fields.setEnabled(not busy)
         self.download_button.setEnabled(not busy)
         self.playlist_subfolder_checkbox.setEnabled(not busy)
+        self.attach_metadata_checkbox.setEnabled(not busy)
         if not busy:
             self.progress.setValue(0)
             self._on_url_changed()
@@ -459,6 +474,7 @@ class MainWindow(QMainWindow):
             output_dir,
             use_subfolder=self.playlist_subfolder_checkbox.isChecked(),
             clip=clip,
+            attach_metadata=self.attach_metadata_checkbox.isChecked(),
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.status.connect(self.status_label.setText)

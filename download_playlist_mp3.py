@@ -35,6 +35,11 @@ def main() -> None:
         action="store_true",
         help="Use browser-style paced downloads (slow; not recommended for playlists)",
     )
+    parser.add_argument(
+        "--no-metadata",
+        action="store_true",
+        help="Download audio only; skip fetching Suno metadata and writing ID3 tags",
+    )
     args = parser.parse_args()
 
     use_subfolder = not args.flat
@@ -56,6 +61,7 @@ def main() -> None:
         on_track=on_track,
         overwrite=args.overwrite,
         download_mode=download_mode,
+        attach_metadata=not args.no_metadata,
     )
 
     print()

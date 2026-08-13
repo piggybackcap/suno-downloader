@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from mutagen.id3 import COMM, TCOM, TDRC, TENC, TIT2, TPE1, TXXX, ID3
+from mutagen.id3 import APIC, COMM, TIT2, TPE1, TXXX, TYER, ID3
 from mutagen.mp3 import MP3
 
 CDN_MP3 = "https://cdn1.suno.ai/{song_id}.mp3"
@@ -68,6 +68,7 @@ class SongMetadata:
     bitrate_kbps: int | None = None
     playlist_name: str | None = None
     playlist_url: str | None = None
+    image_url: str | None = None
     clip_start_sec: float | None = None
     clip_end_sec: float | None = None
 
@@ -291,11 +292,16 @@ def _extract_field(window: str, key: str) -> str | None:
     return _unescape_json_string(match.group(1)) if match else None
 
 
-def fetch_song_metadata(song_id: str, client: httpx.Client | None = None) -> SongMetadata:
+def fetch_song_metadata(
+    song_id: str,
+    client: httpx.Client | None = None,
+    *,
+    full: bool = True,
+) -> SongMetadata:
     """Fetch song metadata from oEmbed and the public song page."""
     if client is None:
         with httpx.Client(headers=DEFAULT_HEADERS, timeout=30) as c:
-            return fetch_song_metadata(song_id, client=c)
+            return fetch_song_metadata(song_id, client=c, full=full)
 
     page_url = f"https://suno.com/song/{song_id}"
     oembed_url = f"{OEMBED_API}?url={page_url}"
@@ -316,6 +322,7 @@ def fetch_song_metadata(song_id: str, client: httpx.Client | None = None) -> Son
     duration_sec = None
     styles = None
     prompt = None
+    image_url = f"https://cdn2.suno.ai/image_large_{song_id}.jpeg"
 
     try:
         page = client.get(page_url, follow_redirects=True)
@@ -336,8 +343,25 @@ def fetch_song_metadata(song_id: str, client: httpx.Client | None = None) -> Son
             duration_raw = _extract_field(window, "duration")
             if duration_raw:
                 duration_sec = float(duration_raw)
+            image_url = (
+                _extract_field(window, "image_large_url")
+                or _extract_field(window, "image_url")
+                or image_url
+            )
+            if image_url:
+                image_url = image_url.strip()
     except httpx.HTTPError:
         pass
+
+    if not full:
+        return SongMetadata(
+            id=song_id,
+            title=title,
+            artist="",
+            audio_url=audio_url,
+            page_url=page_url,
+            duration_sec=duration_sec,
+        )
 
     return SongMetadata(
         id=song_id,
@@ -351,6 +375,7 @@ def fetch_song_metadata(song_id: str, client: httpx.Client | None = None) -> Son
         duration_sec=duration_sec,
         styles=styles,
         prompt=prompt,
+        image_url=image_url,
     )
 
 
@@ -373,6 +398,12 @@ def clip_dict_to_song_metadata(
     duration_sec = float(duration_raw) if duration_raw is not None else None
     styles = nested.get("tags") or clip.get("display_tags")
 
+    image_url = (
+        clip.get("image_large_url")
+        or clip.get("image_url")
+        or f"https://cdn2.suno.ai/image_large_{song_id}.jpeg"
+    )
+
     return SongMetadata(
         id=song_id,
         title=clip.get("title") or song_id,
@@ -387,6 +418,7 @@ def clip_dict_to_song_metadata(
         prompt=nested.get("prompt"),
         playlist_name=playlist.name if playlist else None,
         playlist_url=playlist.page_url if playlist else None,
+        image_url=image_url.strip() if image_url else None,
     )
 
 
@@ -475,7 +507,44 @@ def _format_created_date(created_at: str | None) -> str | None:
         return created_at[:10] if len(created_at) >= 10 else created_at
 
 
-def apply_mp3_tags(path: Path, metadata: SongMetadata) -> None:
+def _guess_image_mime(url: str, content_type: str | None) -> str:
+    if content_type:
+        mime = content_type.split(";", 1)[0].strip().lower()
+        if mime.startswith("image/"):
+            return mime
+    path = url.lower().split("?", 1)[0]
+    if path.endswith(".png"):
+        return "image/png"
+    if path.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _fetch_cover_image(
+    image_url: str,
+    client: httpx.Client | None = None,
+) -> tuple[bytes, str] | None:
+    try:
+        if client is None:
+            with httpx.Client(headers=DEFAULT_HEADERS, timeout=30) as c:
+                return _fetch_cover_image(image_url, client=c)
+        response = client.get(image_url, follow_redirects=True)
+        response.raise_for_status()
+        mime = _guess_image_mime(
+            image_url,
+            response.headers.get("content-type"),
+        )
+        return response.content, mime
+    except Exception:
+        return None
+
+
+def apply_mp3_tags(
+    path: Path,
+    metadata: SongMetadata,
+    *,
+    client: httpx.Client | None = None,
+) -> None:
     """Write ID3 tags for broad cross-platform player compatibility."""
     audio = MP3(path, ID3=ID3)
     if audio.tags is None:
@@ -486,11 +555,13 @@ def apply_mp3_tags(path: Path, metadata: SongMetadata) -> None:
     tags.delall("TPE1")
     tags.delall("TALB")
     tags.delall("TDRC")
+    tags.delall("TYER")
     tags.delall("TCOM")
     tags.delall("TENC")
     tags.delall("COMM")
     tags.delall("TCON")
     tags.delall("TXXX")
+    tags.delall("APIC")
 
     tags.add(TIT2(encoding=3, text=metadata.title))
     if metadata.artist:
@@ -498,21 +569,21 @@ def apply_mp3_tags(path: Path, metadata: SongMetadata) -> None:
 
     created = _format_created_date(metadata.created_at)
     if created:
-        tags.add(TDRC(encoding=3, text=created))
+        tags.add(TYER(encoding=3, text=created[:4]))
 
+    comment_lines: list[str] = []
+    if metadata.styles:
+        comment_lines.append(f"Styles: {metadata.styles}")
+    comment_lines.extend(
+        [
+            f"Suno song: {metadata.page_url}",
+            f"ID: {metadata.id}",
+        ]
+    )
     if metadata.model_name:
-        tags.add(TCOM(encoding=3, text=metadata.model_name))
+        comment_lines.append(f"Model: {metadata.model_name}")
     if metadata.model_version:
-        tags.add(TENC(encoding=3, text=metadata.model_version))
-
-    comment_lines = [
-        f"Suno song: {metadata.page_url}",
-        f"ID: {metadata.id}",
-    ]
-    if metadata.model_version:
-        comment_lines.append(f"Model: {metadata.model_version}")
-    if metadata.model_name:
-        comment_lines.append(f"Engine: {metadata.model_name}")
+        comment_lines.append(f"Version: {metadata.model_version}")
     if metadata.created_at:
         comment_lines.append(f"Created: {metadata.created_at}")
     if metadata.duration_sec is not None:
@@ -522,8 +593,6 @@ def apply_mp3_tags(path: Path, metadata: SongMetadata) -> None:
             f"Clip: {format_timestamp(metadata.clip_start_sec)}–"
             f"{format_timestamp(metadata.clip_end_sec)}"
         )
-    if metadata.styles:
-        comment_lines.append(f"Styles: {metadata.styles}")
     if metadata.prompt:
         comment_lines.append(f"Prompt: {metadata.prompt}")
     if metadata.playlist_name and metadata.playlist_url:
@@ -531,26 +600,43 @@ def apply_mp3_tags(path: Path, metadata: SongMetadata) -> None:
             f"Playlist: {metadata.playlist_name} ({metadata.playlist_url})"
         )
 
-    # Empty desc so players show the comment body (not just a label).
+    comment_text = "\r\n".join(comment_lines)
+    # WMP reads this COMM key for the Comments field; avoid multiple COMM frames.
     tags.add(
         COMM(
-            encoding=3,
+            encoding=1,
             lang="eng",
-            desc="",
-            text="\n".join(comment_lines),
+            desc="ID3v1 Comment",
+            text=comment_text,
         )
     )
 
     if metadata.styles:
         tags.add(TXXX(encoding=3, desc="Styles", text=metadata.styles))
+    if metadata.model_name:
+        tags.add(TXXX(encoding=3, desc="Model", text=metadata.model_name))
     if metadata.model_version:
-        tags.add(TXXX(encoding=3, desc="Model", text=metadata.model_version))
+        tags.add(TXXX(encoding=3, desc="Version", text=metadata.model_version))
     if metadata.created_at:
         tags.add(TXXX(encoding=3, desc="Created", text=metadata.created_at))
     if metadata.playlist_name:
         tags.add(TXXX(encoding=3, desc="Playlist", text=metadata.playlist_name))
 
-    audio.save()
+    if metadata.image_url:
+        cover = _fetch_cover_image(metadata.image_url, client=client)
+        if cover:
+            data, mime = cover
+            tags.add(
+                APIC(
+                    encoding=0,
+                    mime=mime,
+                    type=3,
+                    desc="",
+                    data=data,
+                )
+            )
+
+    audio.save(v2_version=3, v1=0)
 
 
 def download_file(
@@ -704,8 +790,9 @@ def download_song_mp3_from_metadata(
     overwrite: bool = False,
     download_mode: DownloadMode = "fast",
     clip: ClipRange | None = None,
+    attach_metadata: bool = True,
 ) -> tuple[Path, SongMetadata]:
-    """Download and tag an MP3 using pre-fetched metadata (no extra API calls)."""
+    """Download and optionally tag an MP3 using pre-fetched metadata."""
     if clip is not None and download_mode == "streaming":
         raise ValueError(
             "Clip download cannot be used with streaming mode. Use fast download."
@@ -740,7 +827,8 @@ def download_song_mp3_from_metadata(
         mp3_path = output_dir / f"{sanitize_filename(metadata.title)}.mp3"
 
     if mp3_path.exists() and not overwrite:
-        apply_mp3_tags(mp3_path, metadata)
+        if attach_metadata:
+            apply_mp3_tags(mp3_path, metadata, client=client)
         if metadata.bitrate_kbps is None:
             try:
                 metadata.bitrate_kbps = round(MP3(mp3_path).info.bitrate / 1000)
@@ -801,7 +889,8 @@ def download_song_mp3_from_metadata(
         except Exception:
             metadata.duration_sec = end_sec - start_sec
 
-    apply_mp3_tags(mp3_path, metadata)
+    if attach_metadata:
+        apply_mp3_tags(mp3_path, metadata, client=client)
     if metadata.bitrate_kbps is None:
         try:
             metadata.bitrate_kbps = round(MP3(mp3_path).info.bitrate / 1000)
@@ -818,12 +907,17 @@ def download_song_mp3(
     overwrite: bool = False,
     download_mode: DownloadMode = "fast",
     clip: ClipRange | None = None,
+    attach_metadata: bool = True,
 ) -> tuple[Path, SongMetadata]:
-    """Download a Suno song as MP3 from Suno's CDN and tag the file."""
+    """Download a Suno song as MP3 from Suno's CDN and optionally tag the file."""
     song_id = parse_song_id(song_id_or_url)
 
     with httpx.Client(headers=DEFAULT_HEADERS, timeout=120) as client:
-        metadata = fetch_song_metadata(song_id, client=client)
+        metadata = fetch_song_metadata(
+            song_id,
+            client=client,
+            full=attach_metadata,
+        )
         return download_song_mp3_from_metadata(
             metadata,
             output_dir,
@@ -832,6 +926,7 @@ def download_song_mp3(
             overwrite=overwrite,
             download_mode=download_mode,
             clip=clip,
+            attach_metadata=attach_metadata,
         )
 
 
@@ -844,6 +939,7 @@ def download_playlist_mp3(
     on_track: TrackProgressCallback | None = None,
     overwrite: bool = False,
     download_mode: DownloadMode = "fast",
+    attach_metadata: bool = True,
 ) -> tuple[list[Path], list[tuple[SongMetadata, str]], PlaylistMetadata]:
     """
     Download all songs from a public Suno playlist.
@@ -888,6 +984,7 @@ def download_playlist_mp3(
                     progress=track_progress,
                     overwrite=overwrite,
                     download_mode=download_mode,
+                    attach_metadata=attach_metadata,
                 )
                 paths.append(path)
             except Exception as exc:
@@ -921,6 +1018,11 @@ def main() -> None:
         metavar="TIME",
         help="Clip end time (seconds or MM:SS). Blank end means end of song.",
     )
+    parser.add_argument(
+        "--no-metadata",
+        action="store_true",
+        help="Download audio only; skip fetching Suno metadata and writing ID3 tags",
+    )
     args = parser.parse_args()
 
     clip = clip_from_optional_strings(args.start, args.end)
@@ -937,6 +1039,7 @@ def main() -> None:
         args.output,
         progress=on_progress,
         clip=clip,
+        attach_metadata=not args.no_metadata,
     )
     print(f"\nDone: {path}")
 
