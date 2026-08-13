@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from io import BytesIO
 import argparse
+import base64
+import json
 import os
 import re
 import shutil
@@ -11,10 +13,10 @@ import subprocess
 import time
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from mutagen.id3 import APIC, COMM, TIT2, TPE1, TXXX, TYER, ID3
@@ -23,12 +25,21 @@ from mutagen.mp3 import MP3
 CDN_MP3 = "https://cdn1.suno.ai/{song_id}.mp3"
 OEMBED_API = "https://studio-api-prod.suno.com/api/oembed"
 PLAYLIST_API = "https://studio-api-prod.suno.com/api/playlist/{playlist_id}"
+PROFILE_API = "https://studio-api-prod.suno.com/api/profiles/{handle}"
+FEED_V3_API = "https://studio-api-prod.suno.com/api/feed/v3"
+FEED_PAGE_SIZE = 20
+PROFILE_PAGE_BACKOFF_INITIAL_SEC = 10
+PROFILE_PAGE_BACKOFF_MAX_SEC = 60
 SONG_URL_PATTERN = re.compile(
     r"https?://(?:www\.)?suno\.com/song/([0-9a-f-]{36})",
     re.IGNORECASE,
 )
 PLAYLIST_URL_PATTERN = re.compile(
     r"https?://(?:www\.)?suno\.com/playlist/([0-9a-f-]{36})",
+    re.IGNORECASE,
+)
+HOOK_URL_PATTERN = re.compile(
+    r"https?://(?:www\.)?suno\.com/(?:@[^/]+/)?hook/([0-9a-f-]{36})",
     re.IGNORECASE,
 )
 UUID_PATTERN = re.compile(
@@ -41,6 +52,8 @@ STREAMING_CHUNK_BYTES = 256 * 1024
 STREAMING_BUFFER_AHEAD_SEC = 20.0
 
 DownloadMode = Literal["fast", "streaming"]
+HookDownloadFormat = Literal["both", "mp4", "mp3"]
+BulkMediaKind = Literal["song", "hook"]
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -49,7 +62,7 @@ DEFAULT_HEADERS = {
 ProgressCallback = Callable[[int, int | None], None]
 TrackProgressCallback = Callable[[int, int, str], None]
 
-SunoInputKind = Literal["song", "playlist"]
+SunoInputKind = Literal["song", "playlist", "hook"]
 
 
 @dataclass
@@ -71,6 +84,8 @@ class SongMetadata:
     image_url: str | None = None
     clip_start_sec: float | None = None
     clip_end_sec: float | None = None
+    play_count: int | None = None
+    upvote_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +104,51 @@ class PlaylistMetadata:
     page_url: str
     song_count: int
     clips: list[SongMetadata]
+
+
+@dataclass
+class UserProfileMetadata:
+    handle: str
+    display_name: str
+    num_total_clips: int
+    clips: list[SongMetadata]
+
+
+@dataclass
+class HookMetadata:
+    id: str
+    title: str
+    page_url: str
+    video_url: str | None = None
+    audio_url: str | None = None
+    created_at: str | None = None
+    play_count: int | None = None
+    upvote_count: int | None = None
+    duration_sec: float | None = None
+    image_url: str | None = None
+    artist: str | None = None
+    song_id: str | None = None
+
+
+@dataclass
+class TokenSession:
+    token: str
+    handle: str
+    display_name: str | None = None
+    expires_at: datetime | None = None
+
+
+@dataclass
+class BulkMediaItem:
+    kind: BulkMediaKind
+    id: str
+    title: str
+    created_at: str | None = None
+    play_count: int | None = None
+    upvote_count: int | None = None
+    duration_sec: float | None = None
+    song: SongMetadata | None = None
+    hook: HookMetadata | None = None
 
 
 def parse_timestamp(value: str) -> float:
@@ -264,23 +324,709 @@ def parse_playlist_id(value: str) -> str:
     raise ValueError(f"Could not parse Suno playlist ID from: {value}")
 
 
+def parse_playlist_id(value: str) -> str:
+    """Extract a Suno playlist UUID from a URL or raw ID string."""
+    url_match = PLAYLIST_URL_PATTERN.search(value.strip())
+    if url_match:
+        return url_match.group(1)
+
+    candidate = value.strip()
+    if UUID_PATTERN.match(candidate):
+        return candidate
+
+    raise ValueError(f"Could not parse Suno playlist ID from: {value}")
+
+
+def parse_hook_id(value: str) -> str:
+    """Extract a Suno hook UUID from a URL or raw ID string."""
+    url_match = HOOK_URL_PATTERN.search(value.strip())
+    if url_match:
+        return url_match.group(1)
+
+    candidate = value.strip()
+    if UUID_PATTERN.match(candidate):
+        return candidate
+
+    raise ValueError(f"Could not parse Suno hook ID from: {value}")
+
+
 def parse_suno_input(value: str) -> tuple[SunoInputKind, str]:
-    """Detect whether input is a song or playlist URL/ID."""
+    """Detect whether input is a song, playlist, or hook URL/ID."""
     stripped = value.strip()
     if PLAYLIST_URL_PATTERN.search(stripped):
         return "playlist", parse_playlist_id(stripped)
+    if HOOK_URL_PATTERN.search(stripped):
+        return "hook", parse_hook_id(stripped)
     if SONG_URL_PATTERN.search(stripped):
         return "song", parse_song_id(stripped)
     if UUID_PATTERN.match(stripped):
         return "song", stripped
     raise ValueError(
-        "Could not parse Suno URL or ID. Expected a song or playlist URL, "
+        "Could not parse Suno URL or ID. Expected a song, playlist, or hook URL, "
         "or a 36-character UUID."
     )
 
 
+def normalize_bearer_token(raw: str) -> str:
+    """Normalize pasted bearer token input (strip prefixes, validate JWT shape)."""
+    text = raw.strip()
+    if not text:
+        raise ValueError("Bearer token cannot be empty.")
+
+    if text.lower().startswith("authorization:"):
+        text = text.split(":", 1)[1].strip()
+    if text.lower().startswith("bearer "):
+        text = text[7:].strip()
+
+    parts = text.split(".")
+    if len(parts) != 3 or not parts[0].startswith("eyJ"):
+        raise ValueError(
+            "Invalid token format. Paste only the long eyJ… string from the "
+            "Authorization header (the part after 'Bearer ')."
+        )
+    return text
+
+
+def decode_bearer_token_claims(token: str) -> dict[str, Any] | None:
+    """Decode JWT payload without verifying signature (UX only)."""
+    try:
+        normalized = normalize_bearer_token(token)
+    except ValueError:
+        return None
+    parts = normalized.split(".")
+    if len(parts) != 3:
+        return None
+    payload = parts[1]
+    padding = "=" * ((4 - len(payload) % 4) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload + padding)
+        data = json.loads(decoded)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def bearer_token_expires_at(token: str) -> datetime | None:
+    claims = decode_bearer_token_claims(token)
+    if not claims:
+        return None
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)):
+        return None
+    return datetime.fromtimestamp(exp, tz=timezone.utc)
+
+
+def bearer_token_is_expired(token: str) -> bool:
+    expires = bearer_token_expires_at(token)
+    if expires is None:
+        return False
+    return expires <= datetime.now(tz=timezone.utc)
+
+
+def mask_bearer_token(token: str) -> str:
+    if len(token) <= 8:
+        return "…"
+    return f"…{token[-4:]}"
+
+
+def build_auth_headers(token: str) -> dict[str, str]:
+    normalized = normalize_bearer_token(token)
+    return {
+        **DEFAULT_HEADERS,
+        "Authorization": f"Bearer {normalized}",
+        "Origin": "https://suno.com",
+        "Referer": "https://suno.com/",
+        "Content-Type": "application/json",
+    }
+
+
+def _profile_handle(handle: str) -> str:
+    return handle.strip().lstrip("@")
+
+
+def _get_json_with_backoff(
+    client: httpx.Client,
+    url: str,
+    *,
+    params: dict[str, str | int] | None = None,
+) -> dict[str, Any]:
+    backoff = PROFILE_PAGE_BACKOFF_INITIAL_SEC
+    while True:
+        response = client.get(url, params=params)
+        if response.status_code == 429:
+            if backoff > PROFILE_PAGE_BACKOFF_MAX_SEC:
+                raise RuntimeError(
+                    f"Rate limited fetching profile (HTTP 429). "
+                    f"Exceeded {PROFILE_PAGE_BACKOFF_MAX_SEC}s backoff."
+                )
+            time.sleep(backoff)
+            backoff += 5
+            continue
+        if response.status_code == 404:
+            raise ValueError("User not found or profile is not public.")
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("Unexpected profile API response.")
+        return data
+
+
+def fetch_user_profile_clips(
+    handle: str,
+    client: httpx.Client | None = None,
+    *,
+    on_page: Callable[[int, int], None] | None = None,
+) -> UserProfileMetadata:
+    """Fetch all published songs from a public user profile."""
+    if client is None:
+        with httpx.Client(headers=DEFAULT_HEADERS, timeout=60) as c:
+            return fetch_user_profile_clips(handle, client=c, on_page=on_page)
+
+    username = _profile_handle(handle)
+    url = PROFILE_API.format(handle=username)
+    clips: list[SongMetadata] = []
+    page = 1
+    display_name = username
+    num_total = 0
+
+    while True:
+        data = _get_json_with_backoff(
+            client,
+            url,
+            params={
+                "page": page,
+                "playlists_sort_by": "created_at",
+                "clips_sort_by": "created_at",
+            },
+        )
+        if page == 1:
+            display_name = data.get("display_name") or username
+            num_total = int(data.get("num_total_clips") or 0)
+
+        batch = data.get("clips") or []
+        for clip in batch:
+            if not isinstance(clip, dict):
+                continue
+            metadata = clip_dict_to_song_metadata(clip)
+            if metadata is not None:
+                clips.append(metadata)
+
+        if on_page:
+            on_page(page, num_total or len(clips))
+
+        if not batch:
+            break
+        if num_total and len(clips) >= num_total:
+            break
+        page += 1
+
+    return UserProfileMetadata(
+        handle=username,
+        display_name=display_name,
+        num_total_clips=num_total or len(clips),
+        clips=clips,
+    )
+
+
+def _hook_display_title(raw: dict[str, Any], hook_id: str) -> str:
+    """Hooks often use caption instead of title in Suno payloads."""
+    for key in ("caption", "title"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned and cleaned != hook_id:
+                return cleaned
+    return hook_id
+
+
+def _parse_hook_dict(raw: dict[str, Any]) -> HookMetadata | None:
+    hook_id = raw.get("id")
+    if not hook_id:
+        return None
+    title = _hook_display_title(raw, hook_id)
+    video_url = raw.get("video_url")
+    audio_url = raw.get("audio_url")
+    if not video_url and not audio_url:
+        return None
+
+    nested = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    duration_raw = nested.get("duration")
+    duration_sec = float(duration_raw) if duration_raw is not None else None
+    handle = raw.get("handle")
+    page_url = (
+        f"https://suno.com/@{handle}/hook/{hook_id}"
+        if handle
+        else f"https://suno.com/hook/{hook_id}"
+    )
+    image_url = raw.get("image_large_url") or raw.get("image_url")
+    song_id = (
+        nested.get("clip_id")
+        or nested.get("speed_clip_id")
+        or raw.get("original_clip_id")
+    )
+
+    return HookMetadata(
+        id=hook_id,
+        title=title,
+        page_url=page_url,
+        video_url=video_url,
+        audio_url=audio_url,
+        created_at=raw.get("created_at"),
+        play_count=raw.get("play_count"),
+        upvote_count=raw.get("upvote_count"),
+        duration_sec=duration_sec,
+        image_url=image_url.strip() if isinstance(image_url, str) else None,
+        artist=handle,
+        song_id=song_id if isinstance(song_id, str) else None,
+    )
+
+
+def _parse_embedded_clip_objects(html: str, entity_type: str) -> list[dict[str, Any]]:
+    """Extract clip-like JSON objects from Suno SSR/RSC payloads."""
+    results: list[dict[str, Any]] = []
+    marker = f'\\"entity_type\\":\\"{entity_type}\\"'
+    start = 0
+    while True:
+        idx = html.find(marker, start)
+        if idx < 0:
+            break
+        window_start = max(0, idx - 4000)
+        window = html[window_start : idx + 8000]
+        hook_id = _extract_field(window, "id")
+        title = _extract_field(window, "title")
+        caption = _extract_field(window, "caption")
+        if not hook_id:
+            start = idx + len(marker)
+            continue
+
+        nested = {}
+        duration_raw = _extract_field(window, "duration")
+        if duration_raw:
+            try:
+                nested["duration"] = float(duration_raw)
+            except ValueError:
+                pass
+
+        raw: dict[str, Any] = {
+            "id": hook_id,
+            "title": title or caption or hook_id,
+            "caption": caption,
+            "entity_type": entity_type,
+            "video_url": _extract_field(window, "video_url"),
+            "audio_url": _extract_field(window, "audio_url"),
+            "created_at": _extract_field(window, "created_at"),
+            "handle": _extract_field(window, "handle"),
+            "image_url": _extract_field(window, "image_url"),
+            "image_large_url": _extract_field(window, "image_large_url"),
+            "original_clip_id": _extract_field(window, "original_clip_id"),
+            "metadata": nested,
+        }
+        play_count = _extract_field(window, "play_count")
+        if play_count and play_count.isdigit():
+            raw["play_count"] = int(play_count)
+        upvote_count = _extract_field(window, "upvote_count")
+        if upvote_count and upvote_count.isdigit():
+            raw["upvote_count"] = int(upvote_count)
+        results.append(raw)
+        start = idx + len(marker)
+    return results
+
+
+def fetch_user_hooks(
+    handle: str,
+    client: httpx.Client | None = None,
+) -> list[HookMetadata]:
+    """Fetch published hooks from a user's profile hooks tab HTML."""
+    if client is None:
+        with httpx.Client(headers=DEFAULT_HEADERS, timeout=60) as c:
+            return fetch_user_hooks(handle, client=c)
+
+    username = _profile_handle(handle)
+    page_url = f"https://suno.com/@{username}?page=hooks"
+    response = client.get(page_url, follow_redirects=True)
+    response.raise_for_status()
+    html = response.text
+
+    hooks: list[HookMetadata] = []
+    seen: set[str] = set()
+    for raw in _parse_embedded_clip_objects(html, "hook_schema"):
+        metadata = _parse_hook_dict(raw)
+        if metadata is None or metadata.id in seen:
+            continue
+        seen.add(metadata.id)
+        hooks.append(metadata)
+    return hooks
+
+
+def fetch_hook_metadata(
+    hook_id: str,
+    client: httpx.Client | None = None,
+) -> HookMetadata:
+    """Fetch hook metadata by scraping the public hook page."""
+    if client is None:
+        with httpx.Client(headers=DEFAULT_HEADERS, timeout=60) as c:
+            return fetch_hook_metadata(hook_id, client=c)
+
+    page_url = f"https://suno.com/hook/{hook_id}"
+    response = client.get(page_url, follow_redirects=True)
+    response.raise_for_status()
+    html = response.text
+
+    for raw in _parse_embedded_clip_objects(html, "hook_schema"):
+        if raw.get("id") == hook_id:
+            metadata = _parse_hook_dict(raw)
+            if metadata is not None:
+                return metadata
+
+    audio_url = None
+    audio_match = re.search(
+        rf'\\"audio_url\\":\\"(https://cdn[^\\]*{re.escape(hook_id)}[^\\]*)\\"',
+        html,
+    )
+    if audio_match:
+        audio_url = audio_match.group(1)
+    video_match = re.search(
+        rf'\\"video_url\\":\\"(https://cdn[^\\]*)\\"',
+        html,
+    )
+    video_url = video_match.group(1) if video_match else None
+    if not audio_url and not video_url:
+        raise ValueError(f"Could not find downloadable media for hook: {hook_id}")
+
+    title = hook_id
+    for key in ("caption", "title"):
+        match = re.search(rf'\\"{key}\\":\\"((?:\\\\.|[^"\\])*)\\"', html)
+        if match:
+            candidate = _unescape_json_string(match.group(1)).strip()
+            if candidate and candidate != hook_id:
+                title = candidate
+                break
+
+    return HookMetadata(
+        id=hook_id,
+        title=title,
+        page_url=page_url,
+        video_url=video_url,
+        audio_url=audio_url,
+    )
+
+
+def resolve_token_handle(
+    token: str,
+    client: httpx.Client | None = None,
+) -> TokenSession:
+    """Validate bearer token and resolve the authenticated user's handle."""
+    normalized = normalize_bearer_token(token)
+    if bearer_token_is_expired(normalized):
+        raise ValueError("Bearer token has expired. Get a fresh token from suno.com.")
+
+    if client is None:
+        with httpx.Client(headers=build_auth_headers(normalized), timeout=60) as c:
+            return resolve_token_handle(normalized, client=c)
+
+    response = client.post(
+        FEED_V3_API,
+        json={
+            "cursor": None,
+            "limit": 1,
+            "filters": {
+                "disliked": "False",
+                "trashed": "False",
+                "stem": {"presence": "False"},
+                "fromStudioProject": {"presence": "False"},
+            },
+        },
+    )
+    if response.status_code == 401:
+        raise ValueError(
+            "Bearer token was rejected (401). Get a fresh token from suno.com."
+        )
+    response.raise_for_status()
+    data = response.json()
+    clips = data.get("clips") or []
+    if not clips:
+        raise ValueError("Token is valid but no library clips were returned.")
+
+    first = clips[0]
+    handle = first.get("handle")
+    if not handle:
+        raise ValueError("Could not determine Suno handle from token.")
+
+    return TokenSession(
+        token=normalized,
+        handle=handle,
+        display_name=first.get("display_name"),
+        expires_at=bearer_token_expires_at(normalized),
+    )
+
+
+def fetch_private_library(
+    token: str,
+    client: httpx.Client | None = None,
+    *,
+    on_progress: Callable[[int], None] | None = None,
+) -> list[SongMetadata]:
+    """Fetch all songs from the authenticated user's library (including private)."""
+    normalized = normalize_bearer_token(token)
+    if client is None:
+        with httpx.Client(headers=build_auth_headers(normalized), timeout=120) as c:
+            return fetch_private_library(normalized, client=c, on_progress=on_progress)
+
+    clips: list[SongMetadata] = []
+    cursor: str | None = None
+    while True:
+        payload: dict[str, Any] = {
+            "cursor": cursor,
+            "limit": FEED_PAGE_SIZE,
+            "filters": {
+                "disliked": "False",
+                "trashed": "False",
+                "stem": {"presence": "False"},
+                "fromStudioProject": {"presence": "False"},
+            },
+        }
+        response = client.post(FEED_V3_API, json=payload)
+        if response.status_code == 401:
+            raise ValueError(
+                "Bearer token was rejected (401). Get a fresh token from suno.com."
+            )
+        response.raise_for_status()
+        data = response.json()
+        batch = data.get("clips") or []
+        for clip in batch:
+            if not isinstance(clip, dict):
+                continue
+            metadata = clip_dict_to_song_metadata(clip)
+            if metadata is not None:
+                clips.append(metadata)
+        if on_progress:
+            on_progress(len(clips))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+        if not cursor:
+            break
+    return clips
+
+
+def song_metadata_to_bulk_item(metadata: SongMetadata) -> BulkMediaItem:
+    return BulkMediaItem(
+        kind="song",
+        id=metadata.id,
+        title=metadata.title,
+        created_at=metadata.created_at,
+        play_count=metadata.play_count,
+        upvote_count=metadata.upvote_count,
+        duration_sec=metadata.duration_sec,
+        song=metadata,
+    )
+
+
+def hook_metadata_to_bulk_item(metadata: HookMetadata) -> BulkMediaItem:
+    return BulkMediaItem(
+        kind="hook",
+        id=metadata.id,
+        title=metadata.title,
+        created_at=metadata.created_at,
+        play_count=metadata.play_count,
+        upvote_count=metadata.upvote_count,
+        duration_sec=metadata.duration_sec,
+        hook=metadata,
+    )
+
+
+def extract_audio_from_video(src: Path, dest: Path) -> None:
+    """Extract MP3 audio from a video file using ffmpeg."""
+    ffmpeg = resolve_ffmpeg_exe()
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(src),
+        "-vn",
+        "-q:a",
+        "2",
+        str(dest),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode(errors="replace").strip() if exc.stderr else str(exc)
+        raise RuntimeError(f"ffmpeg audio extract failed: {detail}") from exc
+
+
+def download_hook_media(
+    hook: HookMetadata,
+    output_dir: Path,
+    client: httpx.Client,
+    *,
+    hook_format: HookDownloadFormat = "both",
+    progress: ProgressCallback | None = None,
+    overwrite: bool = False,
+    attach_metadata: bool = True,
+) -> list[Path]:
+    """Download hook MP4 and/or MP3 according to format preference."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base_name = sanitize_filename(hook.title)
+    saved: list[Path] = []
+
+    want_mp4 = hook_format in ("both", "mp4")
+    want_mp3 = hook_format in ("both", "mp3")
+
+    mp4_path = output_dir / f"{base_name}.mp4"
+    mp3_path = output_dir / f"{base_name}.mp3"
+    if not overwrite:
+        mp4_path = unique_filepath(mp4_path)
+        mp3_path = unique_filepath(mp3_path)
+    temp_mp4: Path | None = None
+
+    if want_mp4 and hook.video_url:
+        download_file(hook.video_url, mp4_path, client, progress=progress)
+        saved.append(mp4_path)
+
+    if want_mp3:
+        if hook.audio_url:
+            download_file(hook.audio_url, mp3_path, client, progress=progress)
+            if attach_metadata and hook.song_id:
+                song_meta = fetch_song_metadata(hook.song_id, client=client, full=False)
+                song_meta.title = hook.title
+                apply_mp3_tags(mp3_path, song_meta, client=client)
+            saved.append(mp3_path)
+        elif hook.video_url:
+            download_file(hook.audio_url, mp3_path, client, progress=progress)
+            if attach_metadata and hook.song_id:
+                song_meta = fetch_song_metadata(hook.song_id, client=client, full=False)
+                song_meta.title = hook.title
+                apply_mp3_tags(mp3_path, song_meta, client=client)
+            saved.append(mp3_path)
+        elif hook.video_url:
+            source_mp4 = mp4_path if mp4_path.exists() else None
+            if source_mp4 is None:
+                fd, temp_name = tempfile.mkstemp(suffix=".mp4", dir=output_dir)
+                os.close(fd)
+                temp_mp4 = Path(temp_name)
+                download_file(hook.video_url, temp_mp4, client, progress=progress)
+                source_mp4 = temp_mp4
+            extract_audio_from_video(source_mp4, mp3_path)
+            if attach_metadata and hook.song_id:
+                song_meta = fetch_song_metadata(hook.song_id, client=client, full=False)
+                song_meta.title = hook.title
+                apply_mp3_tags(mp3_path, song_meta, client=client)
+            saved.append(mp3_path)
+        else:
+            raise ValueError(f"No audio or video URL for hook: {hook.title}")
+
+    if temp_mp4 is not None:
+        temp_mp4.unlink(missing_ok=True)
+
+    return saved
+
+
+def download_hook(
+    hook_id_or_url: str,
+    output_dir: Path,
+    *,
+    hook_format: HookDownloadFormat = "both",
+    progress: ProgressCallback | None = None,
+    overwrite: bool = False,
+    attach_metadata: bool = True,
+) -> tuple[list[Path], HookMetadata]:
+    hook_id = parse_hook_id(hook_id_or_url)
+    with httpx.Client(headers=DEFAULT_HEADERS, timeout=120) as client:
+        metadata = fetch_hook_metadata(hook_id, client=client)
+        paths = download_hook_media(
+            metadata,
+            output_dir,
+            client,
+            hook_format=hook_format,
+            progress=progress,
+            overwrite=overwrite,
+            attach_metadata=attach_metadata,
+        )
+        return paths, metadata
+
+
+def download_bulk_items(
+    items: list[BulkMediaItem],
+    output_dir: Path,
+    *,
+    folder_name: str,
+    use_subfolder: bool = True,
+    hook_format: HookDownloadFormat = "both",
+    progress: ProgressCallback | None = None,
+    on_item: Callable[[int, int, str], None] | None = None,
+    overwrite: bool = False,
+    attach_metadata: bool = True,
+) -> tuple[list[Path], list[tuple[BulkMediaItem, str]]]:
+    """Download a list of bulk media items (songs and hooks)."""
+    target_dir = output_dir
+    if use_subfolder:
+        target_dir = output_dir / sanitize_filename(folder_name)
+
+    paths: list[Path] = []
+    failures: list[tuple[BulkMediaItem, str]] = []
+    total = len(items)
+
+    with httpx.Client(headers=DEFAULT_HEADERS, timeout=120) as client:
+        for index, item in enumerate(items, start=1):
+            if on_item:
+                on_item(index, total, item.title)
+
+            track_progress: ProgressCallback | None = None
+            if progress:
+                base_pct = (index - 1) * 100
+
+                def track_progress(done: int, total_bytes: int | None, _base=base_pct) -> None:
+                    if total_bytes and total_bytes > 0:
+                        track_pct = min(99, done * 100 // total_bytes)
+                    else:
+                        track_pct = 0 if done == 0 else 50
+                    overall = min(100, (_base + track_pct) // total)
+                    progress(overall, 100)
+
+            try:
+                if item.kind == "song" and item.song is not None:
+                    path, _ = download_song_mp3_from_metadata(
+                        item.song,
+                        target_dir,
+                        client,
+                        progress=track_progress,
+                        overwrite=overwrite,
+                        attach_metadata=attach_metadata,
+                    )
+                    paths.append(path)
+                elif item.kind == "hook" and item.hook is not None:
+                    saved = download_hook_media(
+                        item.hook,
+                        target_dir,
+                        client,
+                        hook_format=hook_format,
+                        progress=track_progress,
+                        overwrite=overwrite,
+                        attach_metadata=attach_metadata,
+                    )
+                    paths.extend(saved)
+                else:
+                    raise ValueError(f"Missing metadata for item: {item.title}")
+            except Exception as exc:
+                failures.append((item, str(exc)))
+
+    if progress:
+        progress(100, 100)
+    return paths, failures
+
+
 def _unescape_json_string(value: str) -> str:
-    return bytes(value, "utf-8").decode("unicode_escape")
+    """Decode JSON-style escapes from SSR payloads without mangling UTF-8 text."""
+    if not value or "\\" not in value:
+        return value
+    try:
+        return json.loads(f'"{value}"')
+    except json.JSONDecodeError:
+        try:
+            return bytes(value, "utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            return value
 
 
 def _extract_field(window: str, key: str) -> str | None:
@@ -419,6 +1165,8 @@ def clip_dict_to_song_metadata(
         playlist_name=playlist.name if playlist else None,
         playlist_url=playlist.page_url if playlist else None,
         image_url=image_url.strip() if image_url else None,
+        play_count=clip.get("play_count"),
+        upvote_count=clip.get("upvote_count"),
     )
 
 
@@ -495,6 +1243,21 @@ def sanitize_filename(name: str) -> str:
     """Make a filesystem-safe filename from a song title."""
     safe = re.sub(r'[<>:"/\\|?*]', "_", name).strip()
     return safe[:120] or "untitled"
+
+
+def unique_filepath(path: Path) -> Path:
+    """Return path, or the next available (2), (3), ... variant if it exists."""
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    counter = 2
+    while True:
+        candidate = parent / f"{stem} ({counter}){suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
 
 
 def _format_created_date(created_at: str | None) -> str | None:
@@ -826,15 +1589,8 @@ def download_song_mp3_from_metadata(
     else:
         mp3_path = output_dir / f"{sanitize_filename(metadata.title)}.mp3"
 
-    if mp3_path.exists() and not overwrite:
-        if attach_metadata:
-            apply_mp3_tags(mp3_path, metadata, client=client)
-        if metadata.bitrate_kbps is None:
-            try:
-                metadata.bitrate_kbps = round(MP3(mp3_path).info.bitrate / 1000)
-            except Exception:
-                pass
-        return mp3_path, metadata
+    if not overwrite:
+        mp3_path = unique_filepath(mp3_path)
 
     download_dest = mp3_path
     temp_path: Path | None = None
@@ -878,6 +1634,8 @@ def download_song_mp3_from_metadata(
             )
             if final_mp3_path != mp3_path:
                 mp3_path = final_mp3_path
+                if not overwrite:
+                    mp3_path = unique_filepath(mp3_path)
         start_sec, end_sec = resolved_clip
         trim_mp3_clip(download_dest, mp3_path, start_sec, end_sec)
         if temp_path is not None:
